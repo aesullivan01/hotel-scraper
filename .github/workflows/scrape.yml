@@ -1,0 +1,35 @@
+name: Hotel Booking Scraper
+
+on:
+  # Runs every day at 7 AM Eastern Time (11:00 UTC)
+  schedule:
+    - cron: '0 11 * * *'
+
+  # Lets you trigger it manually from the Actions tab any time
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browser
+        run: npx playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          GOOGLE_WEB_APP_URL: ${{ secrets.GOOGLE_WEB_APP_URL }}
+        run: node scraper.js
