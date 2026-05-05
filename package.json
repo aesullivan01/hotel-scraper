@@ -1,0 +1,12 @@
+{
+  "name": "hotel-booking-scraper",
+  "version": "1.0.0",
+  "description": "Scrapes Montauk hotel booking data and sends it to Google Sheets",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0"
+  }
+}
