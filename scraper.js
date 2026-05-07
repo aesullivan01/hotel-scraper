@@ -130,6 +130,10 @@ function normalizeRoomType(raw) {
 // Used by: Hero Beach Club, Daunts, Gurneys, Marram, MBH
 // -------------------------------------------------------
 
+// Set to true to dump HTML for debugging — turn off after fixing selectors
+const DEBUG_HTML = process.env.DEBUG_HTML === 'true'
+let debugDumped = false
+
 async function scrapeSynxis(page, hotel, checkIn, los) {
   const checkOut = addDays(checkIn, los)
   const url = hotel.bookingUrl
@@ -151,6 +155,15 @@ async function scrapeSynxis(page, hotel, checkIn, los) {
 
     // Give JS a moment to finish rendering prices
     await page.waitForTimeout(3000)
+
+    // DEBUG: dump first 8000 chars of rendered HTML so we can see the real structure
+    if (DEBUG_HTML && !debugDumped) {
+      debugDumped = true
+      const html = await page.evaluate(() => document.body.innerHTML)
+      console.log('\n===== DEBUG HTML START (first 8000 chars) =====')
+      console.log(html.substring(0, 8000))
+      console.log('===== DEBUG HTML END =====\n')
+    }
 
     // Extract all room data from the rendered page
     const extracted = await page.evaluate(() => {
