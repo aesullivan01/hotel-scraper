@@ -21,6 +21,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm install
@@ -31,4 +32,5 @@ jobs:
       - name: Run scraper
         env:
           GOOGLE_WEB_APP_URL: ${{ secrets.GOOGLE_WEB_APP_URL }}
+          DEBUG_HTML: 'true'
         run: node scraper.js
