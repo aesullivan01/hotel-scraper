@@ -22,39 +22,39 @@ const HOTELS = [
   {
     name:       'Hero Beach Club',
     sourceUrl:  'https://www.herobeachclub.com/',
-    // Synxis booking engine — date params injected at runtime
-    bookingUrl: 'https://be.synxis.com/?hotel=76433&level=hotel&locale=en-US&currency=USD&adult=2&rooms=1',
-    engine:     'synxis',
+    // Navigate to their stay page which embeds the booking widget
+    bookingUrl: 'https://www.herobeachclub.com/stay/',
+    engine:     'widget',
   },
   {
     name:       'Daunts',
     sourceUrl:  'https://www.dauntsalbatross.com/',
-    bookingUrl: 'https://be.synxis.com/?hotel=28205&level=hotel&locale=en-US&currency=USD&adult=2&rooms=1',
-    engine:     'synxis',
+    bookingUrl: 'https://www.dauntsalbatross.com/rooms/',
+    engine:     'widget',
   },
   {
     name:       'Gurneys',
     sourceUrl:  'https://www.gurneysresorts.com/montauk',
-    bookingUrl: 'https://be.synxis.com/?hotel=59289&level=hotel&locale=en-US&currency=USD&adult=2&rooms=1',
-    engine:     'synxis',
+    bookingUrl: 'https://www.gurneysresorts.com/montauk/rooms-suites',
+    engine:     'widget',
   },
   {
     name:       'Marram',
     sourceUrl:  'https://www.marrammontauk.com/',
-    bookingUrl: 'https://be.synxis.com/?hotel=76203&level=hotel&locale=en-US&currency=USD&adult=2&rooms=1',
-    engine:     'synxis',
+    bookingUrl: 'https://www.marrammontauk.com/rooms/',
+    engine:     'widget',
   },
   {
     name:       'MBH',
     sourceUrl:  'https://www.thembh.com/',
-    bookingUrl: 'https://be.synxis.com/?hotel=28210&level=hotel&locale=en-US&currency=USD&adult=2&rooms=1',
-    engine:     'synxis',
+    bookingUrl: 'https://www.thembh.com/rooms/',
+    engine:     'widget',
   },
   {
     name:       'Offshore',
     sourceUrl:  'https://www.offshoremontauk.com/',
-    bookingUrl: 'https://reservations.travelclick.com/4648',
-    engine:     'travelclick',
+    bookingUrl: 'https://www.offshoremontauk.com/rooms/',
+    engine:     'widget',
   },
 ]
 
@@ -130,34 +130,97 @@ function normalizeRoomType(raw) {
 // Used by: Hero Beach Club, Daunts, Gurneys, Marram, MBH
 // -------------------------------------------------------
 
-// Set to true to dump HTML for debugging — turn off after fixing selectors
-const DEBUG_HTML = process.env.DEBUG_HTML === 'true'
+// -------------------------------------------------------
+// WIDGET SCRAPER
+// Navigates to each hotel's own rooms page, fills in dates
+// via the booking widget, then extracts rendered room data.
+// -------------------------------------------------------
+
 let debugDumped = false
 
-async function scrapeSynxis(page, hotel, checkIn, los) {
-  const checkOut = addDays(checkIn, los)
-  const url = hotel.bookingUrl
-    + '&arrive=' + formatDate(checkIn)
-    + '&depart=' + formatDate(checkOut)
-    + '&nights=' + los
+async function scrapeWidget(page, hotel, checkIn, los) {
+  const checkOut    = addDays(checkIn, los)
+  const arriveStr   = formatDate(checkIn)    // MM/DD/YYYY for form inputs
+  const departStr   = formatDate(checkOut)
+  const arriveFull  = checkIn.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
 
-  console.log(`    → ${url}`)
+  console.log(`    → ${hotel.bookingUrl}`)
 
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 })
-
-    // Wait for either room cards or a sold-out message to appear
-    await Promise.race([
-      page.waitForSelector('[class*="room"], [class*="Room"], [class*="rate"], [class*="Rate"]', { timeout: 20000 }),
-      page.waitForSelector('[class*="sold"], [class*="unavailable"], [class*="no-avail"]', { timeout: 20000 }),
-      page.waitForTimeout(20000),
-    ]).catch(() => {})
-
-    // Give JS a moment to finish rendering prices
+    await page.goto(hotel.bookingUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
     await page.waitForTimeout(3000)
 
-    // DEBUG: dump first 8000 chars of rendered HTML so we can see the real structure
-    if (DEBUG_HTML && !debugDumped) {
+    // -- Step 1: Try to intercept XHR/fetch calls for availability data --
+    // Many booking widgets call an API when dates are entered.
+    // We listen for JSON responses that look like availability data.
+    let capturedRooms = []
+
+    page.on('response', async response => {
+      try {
+        const url = response.url()
+        const ct  = response.headers()['content-type'] || ''
+        if (!ct.includes('json')) return
+        if (!url.includes('avail') && !url.includes('room') && !url.includes('rate') && !url.includes('price')) return
+
+        const json = await response.json()
+        const parsed = extractRoomsFromJson(json)
+        if (parsed.length > 0) {
+          capturedRooms.push(...parsed)
+        }
+      } catch (_) {}
+    })
+
+    // -- Step 2: Fill in the date fields in the booking widget --
+    const dateInputSelectors = [
+      'input[name*="arrive"], input[name*="checkin"], input[name*="check_in"], input[placeholder*="Check"], input[placeholder*="Arrival"], input[aria-label*="Check"]',
+    ]
+
+    for (const sel of dateInputSelectors) {
+      try {
+        const input = await page.$(sel)
+        if (input) {
+          await input.click({ clickCount: 3 })
+          await input.fill(arriveStr)
+          await page.keyboard.press('Tab')
+          await page.waitForTimeout(500)
+          break
+        }
+      } catch (_) {}
+    }
+
+    // Try clicking a "Check Availability" or "Search" button
+    const btnSelectors = [
+      'button[type="submit"]',
+      'button:has-text("Check Availability")',
+      'button:has-text("Search")',
+      'button:has-text("Book")',
+      'input[type="submit"]',
+      '[class*="search-btn"]',
+      '[class*="check-avail"]',
+    ]
+
+    for (const sel of btnSelectors) {
+      try {
+        const btn = await page.$(sel)
+        if (btn) {
+          await btn.click()
+          break
+        }
+      } catch (_) {}
+    }
+
+    // Wait for results to load
+    await page.waitForTimeout(5000)
+
+    // -- Step 3: Use intercepted API data if available --
+    if (capturedRooms.length > 0) {
+      console.log(`    ✓ Captured ${capturedRooms.length} rooms from API intercept`)
+      capturedRooms.forEach(r => r.availableCount = capturedRooms.length)
+      return capturedRooms
+    }
+
+    // -- Step 4: DEBUG — dump HTML so we can inspect the real structure --
+    if (!debugDumped) {
       debugDumped = true
       const html = await page.evaluate(() => document.body.innerHTML)
       console.log('\n===== DEBUG HTML START (first 8000 chars) =====')
@@ -165,185 +228,48 @@ async function scrapeSynxis(page, hotel, checkIn, los) {
       console.log('===== DEBUG HTML END =====\n')
     }
 
-    // Extract all room data from the rendered page
+    // -- Step 5: Scrape rendered HTML for room cards --
     const extracted = await page.evaluate(() => {
       const results = []
 
-      // Synxis renders room type cards — selectors cover different versions of their engine
+      // Cast a wide net across booking widget patterns
       const cardSelectors = [
-        '.room-type',
-        '.roomType',
-        '[class*="RoomType"]',
-        '[class*="room-card"]',
-        '[class*="be-room"]',
-        '[class*="roomItem"]',
-        '[class*="room_item"]',
-        '.suite-item',
-        '[data-room-type]',
+        '[class*="room-type"]', '[class*="roomType"]', '[class*="RoomType"]',
+        '[class*="room-card"]', '[class*="roomCard"]', '[class*="room-item"]',
+        '[class*="room_item"]', '[class*="room_type"]', '[class*="be-room"]',
+        '[class*="suite-item"]', '[data-room-type]', '[data-room]',
+        '[class*="accommodation"]', '[class*="unit-item"]',
       ]
 
       let cards = []
       for (const sel of cardSelectors) {
         const found = document.querySelectorAll(sel)
-        if (found.length > 0) {
-          cards = Array.from(found)
-          break
-        }
+        if (found.length > 0) { cards = Array.from(found); break }
       }
 
       cards.forEach(card => {
-        // Room name
-        const nameEl = card.querySelector('h2, h3, h4, [class*="room-name"], [class*="roomName"], [class*="RoomName"], [class*="room-title"], [class*="title"]')
-
-        // Price — look for the lowest/nightly rate element
-        const priceEls = card.querySelectorAll('[class*="rate"], [class*="price"], [class*="amount"], [class*="Price"], [class*="Rate"]')
+        const nameEl = card.querySelector(
+          'h1, h2, h3, h4, [class*="name"], [class*="title"], [class*="heading"]'
+        )
+        const priceEls = card.querySelectorAll(
+          '[class*="rate"], [class*="price"], [class*="amount"], [class*="cost"]'
+        )
         let rawPrice = null
         priceEls.forEach(el => {
-          const text = el.innerText.trim()
-          if (text.includes('$') && !rawPrice) rawPrice = text
+          if (el.innerText && el.innerText.includes('$') && !rawPrice) {
+            rawPrice = el.innerText.trim()
+          }
         })
 
-        // Taxes / total
-        const taxEl = card.querySelector('[class*="tax"], [class*="fee"], [class*="total"]')
-
-        // Rooms remaining urgency text
-        const urgencyEl = card.querySelector('[class*="remain"], [class*="left"], [class*="urgency"], [class*="limited"]')
-
-        // Refundable / cancel policy label
-        const cancelEl = card.querySelector('[class*="cancel"], [class*="refund"], [class*="policy"]')
-
-        // Min stay
-        const minStayEl = card.querySelector('[class*="minimum"], [class*="min-stay"], [class*="minStay"]')
-
-        if (nameEl) {
-          results.push({
-            rawName:      nameEl.innerText.trim(),
-            rawPrice:     rawPrice,
-            rawTax:       taxEl      ? taxEl.innerText.trim()      : null,
-            rawUrgency:   urgencyEl  ? urgencyEl.innerText.trim()  : null,
-            rawCancel:    cancelEl   ? cancelEl.innerText.trim()   : null,
-            rawMinStay:   minStayEl  ? minStayEl.innerText.trim()  : null,
-          })
-        }
-      })
-
-      // Fallback: if no cards found via selectors, scan all text for room+price patterns
-      if (results.length === 0) {
-        const allText = document.body.innerText
-        return { fallbackText: allText, cards: [] }
-      }
-
-      return { cards: results, fallbackText: null }
-    })
-
-    // Process structured card data
-    if (extracted.cards && extracted.cards.length > 0) {
-      const rooms = []
-      extracted.cards.forEach(card => {
-        const normalized = normalizeRoomType(card.rawName)
-        if (!normalized) return   // Skip room types not in our target list
-
-        const nightlyRate = parsePrice(card.rawPrice)
-        const taxes       = parsePrice(card.rawTax)
-
-        // Parse rooms-remaining number from urgency text like "Only 2 left!"
-        let roomsRemaining = null
-        if (card.rawUrgency) {
-          const match = card.rawUrgency.match(/(\d+)/)
-          if (match) roomsRemaining = parseInt(match[1])
-        }
-
-        // Parse min stay from text like "2 night minimum"
-        let minStay = los
-        if (card.rawMinStay) {
-          const match = card.rawMinStay.match(/(\d+)/)
-          if (match) minStay = parseInt(match[1])
-        }
-
-        // Detect refundable vs non-refundable from cancel policy text
-        const isRefundable = card.rawCancel
-          ? card.rawCancel.toLowerCase().includes('refund') || card.rawCancel.toLowerCase().includes('free cancel')
-          : null
-
-        rooms.push({
-          roomType:          normalized,
-          nightlyRate,
-          taxes,
-          refundableRate:    isRefundable === true  ? nightlyRate : (nightlyRate ? nightlyRate + 30 : null),
-          nonRefundableRate: isRefundable === false ? nightlyRate : (nightlyRate ? nightlyRate - 20 : null),
-          roomsRemaining,
-          minStay,
-          soldOut:           false,
-          availableCount:    0,
-        })
-      })
-
-      if (rooms.length > 0) {
-        rooms.forEach(r => r.availableCount = rooms.length)
-        return rooms
-      }
-    }
-
-    // Fallback: scan page text for prices near room type keywords
-    if (extracted.fallbackText) {
-      const rooms = scanTextForRooms(extracted.fallbackText, los)
-      if (rooms.length > 0) return rooms
-    }
-
-    // Check for sold-out signals
-    const pageText = await page.evaluate(() => document.body.innerText.toLowerCase())
-    const soldOutSignals = ['sold out', 'not available', 'no availability', 'no rooms', 'unavailable', 'no rates']
-    if (soldOutSignals.some(s => pageText.includes(s))) {
-      console.log(`    ✗ Sold out detected`)
-      return [{ soldOut: true }]
-    }
-
-    console.log(`    ✗ No rooms parsed — page may use unsupported structure`)
-    return [{ soldOut: true }]
-
-  } catch (err) {
-    console.warn(`    ✗ Error: ${err.message}`)
-    return [{ soldOut: true }]
-  }
-}
-
-
-// -------------------------------------------------------
-// TRAVELCLICK SCRAPER
-// Used by: Offshore
-// -------------------------------------------------------
-
-async function scrapeTravelClick(page, hotel, checkIn, los) {
-  const checkOut = addDays(checkIn, los)
-  const url = `${hotel.bookingUrl}?datein=${formatDateISO(checkIn)}&dateout=${formatDateISO(checkOut)}&adults=2&rooms=1`
-
-  console.log(`    → ${url}`)
-
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 })
-
-    await Promise.race([
-      page.waitForSelector('[class*="room"], [class*="rate"], [class*="price"]', { timeout: 20000 }),
-      page.waitForTimeout(20000),
-    ]).catch(() => {})
-
-    await page.waitForTimeout(3000)
-
-    const extracted = await page.evaluate(() => {
-      const results = []
-      const cards = document.querySelectorAll('[class*="room-type"], [class*="roomType"], [class*="tc-room"], [class*="room-item"]')
-
-      cards.forEach(card => {
-        const nameEl  = card.querySelector('h2, h3, h4, [class*="name"], [class*="title"]')
-        const priceEl = card.querySelector('[class*="price"], [class*="rate"], [class*="amount"]')
         if (nameEl) {
           results.push({
             rawName:  nameEl.innerText.trim(),
-            rawPrice: priceEl ? priceEl.innerText.trim() : null,
+            rawPrice: rawPrice,
           })
         }
       })
 
+      // Last resort — grab all text
       if (results.length === 0) {
         return { fallbackText: document.body.innerText, cards: [] }
       }
@@ -380,6 +306,14 @@ async function scrapeTravelClick(page, hotel, checkIn, los) {
       if (rooms.length > 0) return rooms
     }
 
+    const pageText = await page.evaluate(() => document.body.innerText.toLowerCase())
+    const soldOutSignals = ['sold out', 'not available', 'no availability', 'no rooms', 'unavailable', 'no rates']
+    if (soldOutSignals.some(s => pageText.includes(s))) {
+      console.log(`    ✗ Sold out`)
+      return [{ soldOut: true }]
+    }
+
+    console.log(`    ✗ No rooms parsed`)
     return [{ soldOut: true }]
 
   } catch (err) {
@@ -388,6 +322,42 @@ async function scrapeTravelClick(page, hotel, checkIn, los) {
   }
 }
 
+// Extract rooms from an intercepted JSON API response
+function extractRoomsFromJson(json) {
+  const rooms = []
+  let items = []
+
+  // Handle various response shapes
+  if (Array.isArray(json)) items = json
+  else if (json.roomTypes)       items = json.roomTypes
+  else if (json.rooms)           items = json.rooms
+  else if (json.data?.rooms)     items = json.data.rooms
+  else if (json.data?.roomTypes) items = json.data.roomTypes
+  else if (json.results)         items = json.results
+
+  items.forEach(item => {
+    const rawName    = item.name || item.roomName || item.roomType || item.title || ''
+    const normalized = normalizeRoomType(rawName)
+    if (!normalized) return
+
+    const rate        = item.rate || item.price || item.lowestRate || item.totalRate || item.baseRate || null
+    const nightlyRate = rate ? Math.round(parseFloat(rate)) : null
+
+    rooms.push({
+      roomType:          normalized,
+      nightlyRate,
+      taxes:             item.taxes || item.taxAmount || null,
+      refundableRate:    item.refundableRate || null,
+      nonRefundableRate: item.nonRefundableRate || null,
+      roomsRemaining:    item.availability || item.roomsLeft || item.quantity || null,
+      minStay:           item.minLOS || item.minimumStay || item.minStay || 1,
+      soldOut:           false,
+      availableCount:    0,
+    })
+  })
+
+  return rooms
+}
 
 // -------------------------------------------------------
 // FALLBACK TEXT SCANNER
@@ -577,11 +547,7 @@ async function postToGoogleSheets(rows) {
         process.stdout.write(`  ${formatDateISO(checkIn)} | ${los}N ... `)
 
         let rooms
-        if (hotel.engine === 'travelclick') {
-          rooms = await scrapeTravelClick(page, hotel, checkIn, los)
-        } else {
-          rooms = await scrapeSynxis(page, hotel, checkIn, los)
-        }
+        rooms = await scrapeWidget(page, hotel, checkIn, los)
 
         const rows = buildRows(hotel, checkIn, los, today, rooms)
         allRows.push(...rows)
