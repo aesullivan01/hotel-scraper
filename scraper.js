@@ -14,7 +14,7 @@ const { chromium } = require('playwright')
 // -------------------------------------------------------
 
 const GOOGLE_WEB_APP_URL = process.env.GOOGLE_WEB_APP_URL
-const LOOK_AHEAD_DAYS    = 90
+const LOOK_AHEAD_DAYS    = 3
 const LENGTHS_OF_STAY    = [1, 2, 3]
 const REQUEST_DELAY_MS   = 2000   // Wait between requests to avoid rate limiting
 
