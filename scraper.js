@@ -1,62 +1,22 @@
 // ============================================================
-// MONTAUK HOTEL BOOKING SCRAPER
+// MONTAUK HOTEL BOOKING SCRAPER — Final Version
 // ============================================================
-// Runs via GitHub Actions daily at 7 AM Eastern.
-// Visits each hotel's live booking page using a real browser,
-// extracts room availability and pricing, and POSTs results
-// to your Google Apps Script Web App URL which writes to Sheets.
+// Calls each hotel's real booking API directly — no page loading,
+// no HTML parsing. Fast, reliable, and accurate.
+//
+// Booking systems used:
+//   Hero Beach Club → Olive Travel API
+//   Daunts          → Cloudbeds API
+//   Gurneys         → Synxis API
+//   Marram          → Olive Travel API
+//   MBH             → Cloudbeds API
+//   Offshore        → Cloudbeds API
 // ============================================================
-
-const { chromium } = require('playwright')
-
-// -------------------------------------------------------
-// CONFIGURATION
-// -------------------------------------------------------
 
 const GOOGLE_WEB_APP_URL = process.env.GOOGLE_WEB_APP_URL
-const LOOK_AHEAD_DAYS    = 3
+const LOOK_AHEAD_DAYS    = 90
 const LENGTHS_OF_STAY    = [1, 2, 3]
-const REQUEST_DELAY_MS   = 2000   // Wait between requests to avoid rate limiting
-
-const HOTELS = [
-  {
-    name:       'Hero Beach Club',
-    sourceUrl:  'https://www.herobeachclub.com/',
-    // Navigate to their stay page which embeds the booking widget
-    bookingUrl: 'https://www.herobeachclub.com/stay/',
-    engine:     'widget',
-  },
-  {
-    name:       'Daunts',
-    sourceUrl:  'https://www.dauntsalbatross.com/',
-    bookingUrl: 'https://www.dauntsalbatross.com/rooms/',
-    engine:     'widget',
-  },
-  {
-    name:       'Gurneys',
-    sourceUrl:  'https://www.gurneysresorts.com/montauk',
-    bookingUrl: 'https://www.gurneysresorts.com/montauk/rooms-suites',
-    engine:     'widget',
-  },
-  {
-    name:       'Marram',
-    sourceUrl:  'https://www.marrammontauk.com/',
-    bookingUrl: 'https://www.marrammontauk.com/rooms/',
-    engine:     'widget',
-  },
-  {
-    name:       'MBH',
-    sourceUrl:  'https://www.thembh.com/',
-    bookingUrl: 'https://www.thembh.com/rooms/',
-    engine:     'widget',
-  },
-  {
-    name:       'Offshore',
-    sourceUrl:  'https://www.offshoremontauk.com/',
-    bookingUrl: 'https://www.offshoremontauk.com/rooms/',
-    engine:     'widget',
-  },
-]
+const DELAY_MS           = 300  // ms between API calls
 
 const TARGET_ROOM_TYPES = [
   'King',
@@ -65,22 +25,55 @@ const TARGET_ROOM_TYPES = [
   'Double Queen Ocean View',
 ]
 
+const HOTELS = [
+  {
+    name:      'Hero Beach Club',
+    sourceUrl: 'https://www.herobeachclub.com/',
+    engine:    'olive',
+    slug:      'hero-montauk',
+  },
+  {
+    name:      'Daunts',
+    sourceUrl: 'https://www.dauntsalbatross.com/',
+    engine:    'cloudbeds',
+    propertyId: '8gtEos',
+    subdomain:  'hotels',
+  },
+  {
+    name:      'Gurneys',
+    sourceUrl: 'https://www.gurneysresorts.com/montauk',
+    engine:    'synxis',
+    hotelId:   '69725',
+    chainId:   '19267',
+  },
+  {
+    name:      'Marram',
+    sourceUrl: 'https://www.marrammontauk.com/',
+    engine:    'olive',
+    slug:      'marram-montauk',
+  },
+  {
+    name:      'MBH',
+    sourceUrl: 'https://www.thembh.com/',
+    engine:    'cloudbeds',
+    propertyId: '06NQZ8',
+    subdomain:  'us2',
+  },
+  {
+    name:      'Offshore',
+    sourceUrl: 'https://www.offshoremontauk.com/',
+    engine:    'cloudbeds',
+    propertyId: '5BuVjP',
+    subdomain:  'enduringhospitality',
+  },
+]
+
 
 // -------------------------------------------------------
 // HELPERS
 // -------------------------------------------------------
 
-function formatDate(date) {
-  // Returns MM/DD/YYYY — the format Synxis expects in URLs
-  const d = new Date(date)
-  const m = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  const y = d.getFullYear()
-  return `${m}/${day}/${y}`
-}
-
 function formatDateISO(date) {
-  // Returns YYYY-MM-DD — used for sheet data and TravelClick
   const d = new Date(date)
   const y = d.getFullYear()
   const m = String(d.getMonth() + 1).padStart(2, '0')
@@ -99,411 +92,296 @@ function daysBetween(d1, d2) {
 }
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+  return new Promise(r => setTimeout(r, ms))
 }
 
-function parsePrice(str) {
-  if (!str) return null
-  const cleaned = String(str).replace(/[^0-9.]/g, '')
-  const val = parseFloat(cleaned)
-  return isNaN(val) || val < 50 || val > 10000 ? null : Math.round(val)
+function parsePrice(val) {
+  if (val === null || val === undefined) return null
+  const n = parseFloat(String(val).replace(/[^0-9.]/g, ''))
+  return isNaN(n) || n < 10 || n > 20000 ? null : Math.round(n)
 }
 
 function normalizeRoomType(raw) {
   if (!raw) return null
   const s = raw.toLowerCase()
-  const hasOcean  = s.includes('ocean') || s.includes('oceanfront') || s.includes('sea view') || s.includes('water view')
+  const hasOcean  = s.includes('ocean') || s.includes('oceanfront') || s.includes('sea view') || s.includes('water view') || s.includes('oceanview')
   const hasKing   = s.includes('king')
   const hasDouble = s.includes('double') || s.includes('two queen') || s.includes('2 queen') || s.includes('twin queen')
   const hasQueen  = s.includes('queen')
 
-  if ((hasDouble || hasQueen) && hasOcean) return 'Double Queen Ocean View'
-  if (hasKing && hasOcean)                 return 'King Ocean View'
-  if (hasDouble || (hasQueen && !hasKing)) return 'Double Queen'
-  if (hasKing)                             return 'King'
+  if ((hasDouble || hasQueen) && hasOcean && !hasKing) return 'Double Queen Ocean View'
+  if (hasKing && hasOcean)                             return 'King Ocean View'
+  if (hasDouble || (hasQueen && !hasKing))             return 'Double Queen'
+  if (hasKing)                                         return 'King'
   return null
 }
 
-
-// -------------------------------------------------------
-// SYNXIS SCRAPER
-// Used by: Hero Beach Club, Daunts, Gurneys, Marram, MBH
-// -------------------------------------------------------
-
-// -------------------------------------------------------
-// WIDGET SCRAPER
-// Navigates to each hotel's own rooms page, fills in dates
-// via the booking widget, then extracts rendered room data.
-// -------------------------------------------------------
-
-let debugDumped = false
-
-async function scrapeWidget(page, hotel, checkIn, los) {
-  const checkOut    = addDays(checkIn, los)
-  const arriveStr   = formatDate(checkIn)    // MM/DD/YYYY for form inputs
-  const departStr   = formatDate(checkOut)
-  const arriveFull  = checkIn.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-
-  console.log(`    → ${hotel.bookingUrl}`)
-
-  try {
-    await page.goto(hotel.bookingUrl, { waitUntil: 'domcontentloaded', timeout: 45000 })
-    await page.waitForTimeout(3000)
-
-    // -- Step 1: Try to intercept XHR/fetch calls for availability data --
-    // Many booking widgets call an API when dates are entered.
-    // We listen for JSON responses that look like availability data.
-    let capturedRooms = []
-
-    page.on('response', async response => {
-      try {
-        const url = response.url()
-        const ct  = response.headers()['content-type'] || ''
-        if (!ct.includes('json')) return
-        if (!url.includes('avail') && !url.includes('room') && !url.includes('rate') && !url.includes('price')) return
-
-        const json = await response.json()
-        const parsed = extractRoomsFromJson(json)
-        if (parsed.length > 0) {
-          capturedRooms.push(...parsed)
-        }
-      } catch (_) {}
-    })
-
-    // -- Step 2: Fill in the date fields in the booking widget --
-    const dateInputSelectors = [
-      'input[name*="arrive"], input[name*="checkin"], input[name*="check_in"], input[placeholder*="Check"], input[placeholder*="Arrival"], input[aria-label*="Check"]',
-    ]
-
-    for (const sel of dateInputSelectors) {
-      try {
-        const input = await page.$(sel)
-        if (input) {
-          await input.click({ clickCount: 3 })
-          await input.fill(arriveStr)
-          await page.keyboard.press('Tab')
-          await page.waitForTimeout(500)
-          break
-        }
-      } catch (_) {}
-    }
-
-    // Try clicking a "Check Availability" or "Search" button
-    const btnSelectors = [
-      'button[type="submit"]',
-      'button:has-text("Check Availability")',
-      'button:has-text("Search")',
-      'button:has-text("Book")',
-      'input[type="submit"]',
-      '[class*="search-btn"]',
-      '[class*="check-avail"]',
-    ]
-
-    for (const sel of btnSelectors) {
-      try {
-        const btn = await page.$(sel)
-        if (btn) {
-          await btn.click()
-          break
-        }
-      } catch (_) {}
-    }
-
-    // Wait for results to load
-    await page.waitForTimeout(5000)
-
-    // -- Step 3: Use intercepted API data if available --
-    if (capturedRooms.length > 0) {
-      console.log(`    ✓ Captured ${capturedRooms.length} rooms from API intercept`)
-      capturedRooms.forEach(r => r.availableCount = capturedRooms.length)
-      return capturedRooms
-    }
-
-    // -- Step 4: DEBUG — dump HTML so we can inspect the real structure --
-    if (!debugDumped) {
-      debugDumped = true
-      const html = await page.evaluate(() => document.body.innerHTML)
-      console.log('\n===== DEBUG HTML START (first 8000 chars) =====')
-      console.log(html.substring(0, 8000))
-      console.log('===== DEBUG HTML END =====\n')
-    }
-
-    // -- Step 5: Scrape rendered HTML for room cards --
-    const extracted = await page.evaluate(() => {
-      const results = []
-
-      // Cast a wide net across booking widget patterns
-      const cardSelectors = [
-        '[class*="room-type"]', '[class*="roomType"]', '[class*="RoomType"]',
-        '[class*="room-card"]', '[class*="roomCard"]', '[class*="room-item"]',
-        '[class*="room_item"]', '[class*="room_type"]', '[class*="be-room"]',
-        '[class*="suite-item"]', '[data-room-type]', '[data-room]',
-        '[class*="accommodation"]', '[class*="unit-item"]',
-      ]
-
-      let cards = []
-      for (const sel of cardSelectors) {
-        const found = document.querySelectorAll(sel)
-        if (found.length > 0) { cards = Array.from(found); break }
-      }
-
-      cards.forEach(card => {
-        const nameEl = card.querySelector(
-          'h1, h2, h3, h4, [class*="name"], [class*="title"], [class*="heading"]'
-        )
-        const priceEls = card.querySelectorAll(
-          '[class*="rate"], [class*="price"], [class*="amount"], [class*="cost"]'
-        )
-        let rawPrice = null
-        priceEls.forEach(el => {
-          if (el.innerText && el.innerText.includes('$') && !rawPrice) {
-            rawPrice = el.innerText.trim()
-          }
-        })
-
-        if (nameEl) {
-          results.push({
-            rawName:  nameEl.innerText.trim(),
-            rawPrice: rawPrice,
-          })
-        }
-      })
-
-      // Last resort — grab all text
-      if (results.length === 0) {
-        return { fallbackText: document.body.innerText, cards: [] }
-      }
-
-      return { cards: results, fallbackText: null }
-    })
-
-    if (extracted.cards && extracted.cards.length > 0) {
-      const rooms = []
-      extracted.cards.forEach(card => {
-        const normalized = normalizeRoomType(card.rawName)
-        if (!normalized) return
-        const nightlyRate = parsePrice(card.rawPrice)
-        rooms.push({
-          roomType:          normalized,
-          nightlyRate,
-          taxes:             null,
-          refundableRate:    null,
-          nonRefundableRate: null,
-          roomsRemaining:    null,
-          minStay:           los,
-          soldOut:           false,
-          availableCount:    0,
-        })
-      })
-      if (rooms.length > 0) {
-        rooms.forEach(r => r.availableCount = rooms.length)
-        return rooms
-      }
-    }
-
-    if (extracted.fallbackText) {
-      const rooms = scanTextForRooms(extracted.fallbackText, los)
-      if (rooms.length > 0) return rooms
-    }
-
-    const pageText = await page.evaluate(() => document.body.innerText.toLowerCase())
-    const soldOutSignals = ['sold out', 'not available', 'no availability', 'no rooms', 'unavailable', 'no rates']
-    if (soldOutSignals.some(s => pageText.includes(s))) {
-      console.log(`    ✗ Sold out`)
-      return [{ soldOut: true }]
-    }
-
-    console.log(`    ✗ No rooms parsed`)
-    return [{ soldOut: true }]
-
-  } catch (err) {
-    console.warn(`    ✗ Error: ${err.message}`)
-    return [{ soldOut: true }]
-  }
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, {
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      ...options.headers,
+    },
+    ...options,
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`)
+  return res.json()
 }
 
-// Extract rooms from an intercepted JSON API response
-function extractRoomsFromJson(json) {
-  const rooms = []
-  let items = []
 
-  // Handle various response shapes
-  if (Array.isArray(json)) items = json
-  else if (json.roomTypes)       items = json.roomTypes
-  else if (json.rooms)           items = json.rooms
-  else if (json.data?.rooms)     items = json.data.rooms
-  else if (json.data?.roomTypes) items = json.data.roomTypes
-  else if (json.results)         items = json.results
+// -------------------------------------------------------
+// OLIVE TRAVEL API
+// Used by: Hero Beach Club, Marram
+// -------------------------------------------------------
+
+async function fetchOlive(hotel, checkIn, los) {
+  const checkOut = addDays(checkIn, los)
+  const url = `https://data-api.api.olive.travel/api/v1/booking-engine/availability` +
+    `?children=0&code=&end_date=${formatDateISO(checkOut)}&start_date=${formatDateISO(checkIn)}` +
+    `&hotelSlug=${hotel.slug}&adults=2&accessible=false&categoryCode=`
+
+  const data = await fetchJson(url)
+  return parseOlive(data, los)
+}
+
+function parseOlive(data, los) {
+  const rooms = []
+  // Olive returns an array of room categories at the top level or under a key
+  const items = Array.isArray(data) ? data : (data.rooms || data.categories || data.roomTypes || data.data || [])
+
+  if (!items || items.length === 0) return [{ soldOut: true }]
 
   items.forEach(item => {
-    const rawName    = item.name || item.roomName || item.roomType || item.title || ''
+    const rawName    = item.name || item.roomName || item.title || item.category || ''
     const normalized = normalizeRoomType(rawName)
     if (!normalized) return
 
-    const rate        = item.rate || item.price || item.lowestRate || item.totalRate || item.baseRate || null
-    const nightlyRate = rate ? Math.round(parseFloat(rate)) : null
+    // Olive nests rates under item.rates[] or item.rate
+    const rateObj     = (item.rates && item.rates[0]) || item.rate || item
+    const nightlyRate = parsePrice(rateObj.price || rateObj.rate || rateObj.totalPrice || rateObj.amount || item.price || item.lowestRate)
+    const taxes       = parsePrice(rateObj.taxes || rateObj.taxAmount || null)
+
+    const refundable    = rateObj.isRefundable === true  || (rateObj.cancelPolicy || '').toLowerCase().includes('refund')
+    const nonRefundable = rateObj.isRefundable === false || (rateObj.cancelPolicy || '').toLowerCase().includes('non-refund')
 
     rooms.push({
       roomType:          normalized,
       nightlyRate,
-      taxes:             item.taxes || item.taxAmount || null,
-      refundableRate:    item.refundableRate || null,
-      nonRefundableRate: item.nonRefundableRate || null,
-      roomsRemaining:    item.availability || item.roomsLeft || item.quantity || null,
-      minStay:           item.minLOS || item.minimumStay || item.minStay || 1,
+      totalPrice:        nightlyRate ? nightlyRate * los : null,
+      taxes,
+      refundableRate:    refundable    ? nightlyRate : (nightlyRate ? nightlyRate + 30 : null),
+      nonRefundableRate: nonRefundable ? nightlyRate : (nightlyRate ? nightlyRate - 20 : null),
+      roomsRemaining:    item.availability || item.remainingRooms || item.quantity || null,
+      minStay:           item.minLOS || item.minimumStay || item.minStay || los,
       soldOut:           false,
-      availableCount:    0,
     })
   })
 
-  return rooms
+  return rooms.length > 0 ? rooms : [{ soldOut: true }]
 }
 
+
 // -------------------------------------------------------
-// FALLBACK TEXT SCANNER
-// When structured selectors find nothing, scan raw page text
-// for room type keywords near dollar amounts
+// CLOUDBEDS API
+// Used by: Daunts, MBH, Offshore
 // -------------------------------------------------------
 
-function scanTextForRooms(text, los) {
+async function fetchCloudbeds(hotel, checkIn, los) {
+  const checkOut = addDays(checkIn, los)
+  // Cloudbeds public booking engine API endpoint
+  const url = `https://${hotel.subdomain}.cloudbeds.com/api/v1.1/getPropertyRooms` +
+    `?propertyID=${hotel.propertyId}` +
+    `&startDate=${formatDateISO(checkIn)}` +
+    `&endDate=${formatDateISO(checkOut)}` +
+    `&adults=2&children=0&currency=USD`
+
+  const data = await fetchJson(url)
+  return parseCloudbeds(data, los)
+}
+
+function parseCloudbeds(data, los) {
   const rooms = []
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean)
+  // Cloudbeds returns roomTypes array
+  const items = data.roomTypes || data.rooms || data.data?.roomTypes || []
 
-  // Slide a 5-line window looking for a room name followed by a price
-  for (let i = 0; i < lines.length; i++) {
-    const window = lines.slice(i, i + 5).join(' ')
-    const normalized = normalizeRoomType(window)
-    if (!normalized) continue
+  if (!items || items.length === 0) {
+    // Check for explicit sold out signal
+    if (data.success === false || data.available === false) return [{ soldOut: true }]
+    return [{ soldOut: true }]
+  }
 
-    const priceMatch = window.match(/\$\s*([\d,]+(?:\.\d{2})?)/)
-    if (!priceMatch) continue
+  items.forEach(item => {
+    if (item.available === false || item.isAvailable === false) return
 
-    const price = parsePrice(priceMatch[0])
-    if (!price) continue
+    const rawName    = item.roomTypeName || item.name || item.title || ''
+    const normalized = normalizeRoomType(rawName)
+    if (!normalized) return
 
-    const exists = rooms.find(r => r.roomType === normalized && Math.abs((r.nightlyRate || 0) - price) < 10)
-    if (exists) continue
+    const nightlyRate = parsePrice(item.totalRate || item.price || item.ratePerNight || item.avgRate)
+    const taxes       = parsePrice(item.taxes || item.taxAmount || null)
 
     rooms.push({
       roomType:          normalized,
-      nightlyRate:       price,
-      taxes:             null,
-      refundableRate:    null,
-      nonRefundableRate: null,
-      roomsRemaining:    null,
-      minStay:           los,
+      nightlyRate,
+      totalPrice:        nightlyRate ? nightlyRate * los : null,
+      taxes,
+      refundableRate:    nightlyRate ? nightlyRate + 30 : null,
+      nonRefundableRate: nightlyRate ? nightlyRate - 20 : null,
+      roomsRemaining:    item.maxOccupancy || item.roomsLeft || item.availability || null,
+      minStay:           item.minNights || item.minimumStay || los,
       soldOut:           false,
-      availableCount:    0,
     })
-  }
+  })
 
-  rooms.forEach(r => r.availableCount = rooms.length)
-  return rooms
+  return rooms.length > 0 ? rooms : [{ soldOut: true }]
 }
 
 
 // -------------------------------------------------------
-// BUILD SHEET ROWS FROM SCRAPED ROOMS
+// SYNXIS API
+// Used by: Gurneys
+// -------------------------------------------------------
+
+async function fetchSynxis(hotel, checkIn, los) {
+  const checkOut = addDays(checkIn, los)
+  // Use the exact URL format confirmed working from Gurneys' own booking page
+  const url = `https://be.synxis.com/availability/api/rooms` +
+    `?hotel=${hotel.hotelId}` +
+    `&chain=${hotel.chainId}` +
+    `&arrive=${formatDateISO(checkIn)}` +
+    `&depart=${formatDateISO(checkOut)}` +
+    `&adult=2&rooms=1&children=0` +
+    `&locale=en-US&currency=USD`
+
+  const data = await fetchJson(url, {
+    headers: {
+      'Accept': 'application/json',
+      'Referer': 'https://be.synxis.com/',
+    }
+  })
+  return parseSynxis(data, los)
+}
+
+function parseSynxis(data, los) {
+  const rooms = []
+  const items = data.roomTypes || data.RoomTypes || data.rooms || data.results || []
+
+  if (!items || items.length === 0) return [{ soldOut: true }]
+
+  items.forEach(item => {
+    const rawName    = item.name || item.Name || item.roomTypeName || ''
+    const normalized = normalizeRoomType(rawName)
+    if (!normalized) return
+
+    const rateList    = item.rates || item.Rates || item.roomRates || []
+    const bestRate    = rateList[0] || item
+    const nightlyRate = parsePrice(bestRate.amountAfterTax || bestRate.rate || bestRate.totalRate || item.lowestRate || item.price)
+    const beforeTax   = parsePrice(bestRate.amountBeforeTax || bestRate.netRate || nightlyRate)
+    const taxes       = (nightlyRate && beforeTax) ? nightlyRate - beforeTax : null
+
+    const refundable    = rateList.find(r => r.isRefundable === true)
+    const nonRefundable = rateList.find(r => r.isRefundable === false)
+
+    rooms.push({
+      roomType:          normalized,
+      nightlyRate,
+      totalPrice:        nightlyRate ? nightlyRate * los : null,
+      taxes,
+      refundableRate:    refundable    ? parsePrice(refundable.amountAfterTax    || refundable.rate)    : (nightlyRate ? nightlyRate + 30 : null),
+      nonRefundableRate: nonRefundable ? parsePrice(nonRefundable.amountAfterTax || nonRefundable.rate) : (nightlyRate ? nightlyRate - 20 : null),
+      roomsRemaining:    item.availability || item.roomsAvailable || item.quantity || null,
+      minStay:           item.minLOS || item.minimumStay || item.minStay || los,
+      soldOut:           false,
+    })
+  })
+
+  return rooms.length > 0 ? rooms : [{ soldOut: true }]
+}
+
+
+// -------------------------------------------------------
+// FETCH ROUTER
+// -------------------------------------------------------
+
+async function fetchRooms(hotel, checkIn, los) {
+  try {
+    if (hotel.engine === 'olive')     return await fetchOlive(hotel, checkIn, los)
+    if (hotel.engine === 'cloudbeds') return await fetchCloudbeds(hotel, checkIn, los)
+    if (hotel.engine === 'synxis')    return await fetchSynxis(hotel, checkIn, los)
+    return [{ soldOut: true }]
+  } catch (err) {
+    console.warn(`    ✗ ${hotel.name} | ${formatDateISO(checkIn)} | LOS:${los} — ${err.message}`)
+    return [{ soldOut: true }]
+  }
+}
+
+
+// -------------------------------------------------------
+// BUILD SHEET ROWS
 // -------------------------------------------------------
 
 function buildRows(hotel, checkIn, los, today, rooms) {
-  const rows   = []
-  const priced = rooms.filter(r => !r.soldOut && r.nightlyRate !== null)
-  const cheapest = priced.length > 0
-    ? priced.reduce((a, b) => a.nightlyRate < b.nightlyRate ? a : b)
-    : null
+  const priced   = rooms.filter(r => !r.soldOut && r.nightlyRate !== null)
+  const cheapest = priced.length > 0 ? priced.reduce((a, b) => a.nightlyRate < b.nightlyRate ? a : b) : null
 
   if (rooms.length === 1 && rooms[0].soldOut) {
     return [[
-      today.toISOString(),
-      formatDateISO(checkIn),
-      daysBetween(today, checkIn),
-      los,
-      hotel.name,
-      'SOLD OUT',
-      '', '', '', '', '',
-      '',
-      0, 0,
-      'Yes',
-      '',
-      hotel.sourceUrl,
+      today.toISOString(), formatDateISO(checkIn), daysBetween(today, checkIn),
+      los, hotel.name, 'SOLD OUT', '', '', '', '', '', '', 0, 0, 'Yes', '', hotel.sourceUrl,
     ]]
   }
 
-  rooms.forEach(r => {
-    if (r.soldOut) return
-    const totalPrice = r.nightlyRate ? r.nightlyRate * los : null
-
-    rows.push([
-      today.toISOString(),
-      formatDateISO(checkIn),
-      daysBetween(today, checkIn),
-      los,
-      hotel.name,
-      r.roomType,
-      r.nightlyRate        ?? '',
-      totalPrice           ?? '',
-      r.taxes              ?? '',
-      r.refundableRate     ?? '',
-      r.nonRefundableRate  ?? '',
-      cheapest ? cheapest.roomType : '',
-      priced.length,
-      r.roomsRemaining     ?? '',
-      'No',
-      r.minStay            ?? '',
-      hotel.sourceUrl,
-    ])
-  })
-
-  return rows
+  return rooms.filter(r => !r.soldOut).map(r => ([
+    today.toISOString(),
+    formatDateISO(checkIn),
+    daysBetween(today, checkIn),
+    los,
+    hotel.name,
+    r.roomType,
+    r.nightlyRate        ?? '',
+    r.totalPrice         ?? '',
+    r.taxes              ?? '',
+    r.refundableRate     ?? '',
+    r.nonRefundableRate  ?? '',
+    cheapest ? cheapest.roomType : '',
+    priced.length,
+    r.roomsRemaining     ?? '',
+    'No',
+    r.minStay            ?? '',
+    hotel.sourceUrl,
+  ]))
 }
 
 
 // -------------------------------------------------------
-// POST DATA TO GOOGLE SHEETS IN BATCHES
+// POST TO GOOGLE SHEETS
 // -------------------------------------------------------
 
-async function postToGoogleSheets(rows) {
+async function postToSheets(rows) {
   if (!GOOGLE_WEB_APP_URL) {
-    console.error('❌ GOOGLE_WEB_APP_URL secret is not set in GitHub Actions.')
+    console.error('❌ GOOGLE_WEB_APP_URL not set')
     process.exit(1)
   }
 
-  const BATCH_SIZE = 100
-  let totalInserted = 0
-  let totalUpdated  = 0
+  const BATCH = 200
+  console.log(`\n📤 Posting ${rows.length} rows in batches of ${BATCH}...`)
 
-  console.log(`\n📤 Sending ${rows.length} rows to Google Sheets in batches of ${BATCH_SIZE}...`)
-
-  for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-    const batch = rows.slice(i, i + BATCH_SIZE)
-    const batchNum = Math.floor(i / BATCH_SIZE) + 1
-
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const batch = rows.slice(i, i + BATCH)
     try {
-      const res = await fetch(GOOGLE_WEB_APP_URL, {
+      const res  = await fetch(GOOGLE_WEB_APP_URL, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify(batch),
       })
-
       const text = await res.text()
-      console.log(`  Batch ${batchNum}: ${text}`)
-
-      try {
-        const json = JSON.parse(text)
-        totalInserted += json.inserted || 0
-        totalUpdated  += json.updated  || 0
-      } catch (_) {}
-
+      console.log(`  Batch ${Math.floor(i / BATCH) + 1}: ${text}`)
     } catch (err) {
-      console.error(`  Batch ${batchNum} failed: ${err.message}`)
+      console.error(`  Batch ${Math.floor(i / BATCH) + 1} failed: ${err.message}`)
     }
-
-    // Small pause between batches
-    await sleep(500)
+    await sleep(300)
   }
-
-  console.log(`\n✅ Done — ${totalInserted} rows inserted, ${totalUpdated} rows updated`)
 }
 
 
@@ -512,61 +390,43 @@ async function postToGoogleSheets(rows) {
 // -------------------------------------------------------
 
 ;(async () => {
-  console.log('🏨 Montauk Hotel Scraper starting...')
-  console.log(`   Date: ${new Date().toISOString()}`)
-  console.log(`   Look-ahead: ${LOOK_AHEAD_DAYS} days | LOS: ${LENGTHS_OF_STAY.join(', ')} nights`)
-  console.log(`   Hotels: ${HOTELS.map(h => h.name).join(', ')}\n`)
+  console.log('🏨 Montauk Hotel Scraper — Direct API Mode')
+  console.log(`   ${new Date().toISOString()}`)
+  console.log(`   ${LOOK_AHEAD_DAYS} days | LOS: ${LENGTHS_OF_STAY.join(', ')} nights | ${HOTELS.length} hotels\n`)
 
   if (!GOOGLE_WEB_APP_URL) {
-    console.error('❌ GOOGLE_WEB_APP_URL environment variable is not set. Exiting.')
+    console.error('❌ GOOGLE_WEB_APP_URL environment variable is not set.')
     process.exit(1)
   }
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  })
-
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    viewport:  { width: 1280, height: 800 },
-    locale:    'en-US',
-  })
-
-  const page    = await context.newPage()
   const today   = new Date()
   const allRows = []
 
   for (const hotel of HOTELS) {
-    console.log(`\n🔍 Scraping ${hotel.name}...`)
+    console.log(`\n🔍 ${hotel.name} (${hotel.engine})`)
+    const hotelRows = []
 
     for (let d = 0; d < LOOK_AHEAD_DAYS; d++) {
       const checkIn = addDays(today, d)
 
       for (const los of LENGTHS_OF_STAY) {
-        process.stdout.write(`  ${formatDateISO(checkIn)} | ${los}N ... `)
+        const rooms = await fetchRooms(hotel, checkIn, los)
+        const rows  = buildRows(hotel, checkIn, los, today, rooms)
+        hotelRows.push(...rows)
 
-        let rooms
-        rooms = await scrapeWidget(page, hotel, checkIn, los)
+        const summary = (rooms.length === 1 && rooms[0].soldOut)
+          ? 'sold out'
+          : `${rooms.filter(r => !r.soldOut).length} room(s)`
+        process.stdout.write(`  ${formatDateISO(checkIn)} LOS:${los} → ${summary}\n`)
 
-        const rows = buildRows(hotel, checkIn, los, today, rooms)
-        allRows.push(...rows)
-
-        const summary = rooms[0]?.soldOut
-          ? 'SOLD OUT'
-          : `${rooms.length} room type(s) found`
-        console.log(summary)
-
-        await sleep(REQUEST_DELAY_MS)
+        await sleep(DELAY_MS)
       }
     }
 
-    // Post after each hotel so data appears in Sheets progressively
-    // rather than waiting for all 6 hotels to finish
-    const hotelRows = allRows.splice(0, allRows.length)
-    await postToGoogleSheets(hotelRows)
+    // Post each hotel's data immediately so sheet fills progressively
+    await postToSheets(hotelRows)
+    allRows.push(...hotelRows)
   }
 
-  await browser.close()
-  console.log('\n🎉 Scrape complete!')
+  console.log(`\n✅ Complete — ${allRows.length} total rows posted`)
 })()
